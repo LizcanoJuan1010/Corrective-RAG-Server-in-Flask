@@ -7,9 +7,11 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import Literal
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 import logging
 import os
+import time
+from functools import lru_cache
 from .db_utils import get_db_engine
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities.sql_database import SQLDatabase
@@ -131,7 +133,12 @@ def create_sql_agent_executor():
         """
         # The observation is the result of the SQL query, returned as a string.
         # It's the second element of the tuple in the first intermediate step.
-        observation = sql_result["intermediate_steps"][0][1]
+        try:
+            observation = sql_result["intermediate_steps"][0][1]
+        except (IndexError, KeyError):
+            logger.warning("No se pudo extraer la observación de los pasos intermedios del agente SQL.")
+            return []
+
         import ast
         try:
             # The result is a string representation of a list of tuples, e.g., "[(1,), (2,)]"
@@ -158,32 +165,42 @@ def get_components():
     return _components
 
 
+@lru_cache(maxsize=128)
 def process_query(query_text: str) -> dict:
     """Procesa consultas y devuelve respuestas estructuradas"""
     try:
+        start_time = time.time()
         components = get_components()
         logger.info(f"Procesando consulta: {query_text}")
 
         # 1. Mejorar la pregunta
+        step_start_time = time.time()
         improved_question = components["question_rewriter"].invoke({"question": query_text})
+        logger.info(f"Paso 1 (Mejorar pregunta) completado en {time.time() - step_start_time:.2f} segundos")
 
         # 2. Consultar a la base de datos SQL con el agente
+        step_start_time = time.time()
         sql_agent_executor = components["sql_agent_executor"]
         sql_result = sql_agent_executor.invoke({"input": improved_question})
+        logger.info(f"Paso 2 (Consulta SQL) completado en {time.time() - step_start_time:.2f} segundos")
 
         # 3. Recuperar documentos relevantes y filtrar por licitacion_id
+        step_start_time = time.time()
         retriever = components["retriever"]
         if sql_result:
             retriever = components["vector_db"].as_retriever(
                 search_kwargs={"k": 10, "filter": {"licitacion_id": {"$in": sql_result}}}
             )
         docs = retriever.invoke(improved_question)
+        logger.info(f"Paso 3 (Recuperación de documentos) completado en {time.time() - step_start_time:.2f} segundos")
 
         # 4. Evaluar relevancia de documentos con manejo de errores
+        step_start_time = time.time()
         relevance_result = components["retrieval_grader"].invoke({
             "document": docs[0].page_content if docs else "No hay documentos",
             "question": improved_question
         })
+        logger.info(f"Paso 4 (Evaluación de relevancia) completado en {time.time() - step_start_time:.2f} segundos")
 
         try:
             relevance = RetrievalEvaluator(**relevance_result)
@@ -191,13 +208,34 @@ def process_query(query_text: str) -> dict:
             logger.error(f"Error validando evaluación: {e}")
             relevance = RetrievalEvaluator(binary_score="no")
 
-        # 5. Buscar en web y generar respuesta
-        web_results = components["web_search_tool"].invoke(improved_question)
+        # 5. Búsqueda en paralelo y generación de respuesta
+        step_start_time = time.time()
+
+        # Define el paso de recuperación en paralelo
+        parallel_retrieval = RunnableParallel(
+            docs=retriever,
+            web_results=components["web_search_tool"]
+        )
+
+        # Invoca la cadena paralela y luego la cadena de respuesta
+        try:
+            retrieved_data = parallel_retrieval.invoke(improved_question)
+        except Exception as e:
+            logger.error(f"Error durante la búsqueda en paralelo: {e}")
+            # Si la búsqueda en paralelo falla, intenta al menos obtener los documentos
+            retrieved_data = {"docs": retriever.invoke(improved_question), "web_results": []}
+
         final_answer = components["answer_chain"].invoke({
             "question": improved_question,
-            "docs": docs,
-            "web_results": web_results
+            "docs": retrieved_data["docs"],
+            "web_results": retrieved_data["web_results"]
         })
+
+        logger.info(f"Paso 5 (Búsqueda en paralelo y generación de respuesta) completado en {time.time() - step_start_time:.2f} segundos")
+
+        web_results = retrieved_data["web_results"]
+
+        logger.info(f"Consulta completa procesada en {time.time() - start_time:.2f} segundos")
 
         web_urls = list({res.get('url') for res in web_results if res.get('url')})
 
