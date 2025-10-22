@@ -39,8 +39,16 @@ python -m app.populate_database
 
 ### 5. Run the Server
 
+#### Development
+
 ```bash
 python main.py
+```
+
+#### Production
+
+```bash
+gunicorn -c gunicorn.conf.py main:app
 ```
 
 ## API Endpoints
