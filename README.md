@@ -1,92 +1,89 @@
 # Corrective-RAG-Server-in-Flask
 
-This project is a Flask-based server that implements a hybrid RAG (Retrieval-Augmented Generation) system. It can query both a PostgreSQL database for structured data and a ChromaDB vector store for unstructured data.
+This project is a Flask-based server that implements a hybrid RAG (Retrieval-Augmented Generation) system. It can query both a PostgreSQL database for structured data and a ChromaDB vector store for unstructured data. This project is fully containerized with Docker for easy setup and deployment.
+
+## Prerequisites
+
+-   Docker
+-   Docker Compose
 
 ## Setup
 
-### 1. Install Dependencies
+### 1. Configure Environment Variables
+
+1.  Create a file named `.env` in the root of the project by copying the example file:
+    ```bash
+    cp .env.example .env
+    ```
+2.  Open the `.env` file and **edit the variables** to match your desired configuration. At a minimum, you must set `TAVILY_API_KEY`. The database credentials will be used by Docker Compose to initialize the PostgreSQL container.
+
+    ```
+    # PostgreSQL Settings
+    DB_USER=user
+    DB_PASSWORD=password
+    DB_HOST=db
+    DB_PORT=5432
+    DB_NAME=rag_db
+
+    # Tavily API Key for web search
+    TAVILY_API_KEY=your_tavily_api_key
+    ```
+    **Note:** The `DB_HOST` must be `db`, which is the service name of the PostgreSQL container in `docker-compose.yml`.
+
+### 2. Build and Run the Containers
+
+From the root of the project, run the following command:
 
 ```bash
-pip install -r app/requirements.txt
+docker-compose up --build
 ```
 
-### 2. Set Up PostgreSQL
+This command will:
+1.  Build the Docker image for the Flask application.
+2.  Download the official PostgreSQL image.
+3.  Start both the application and the database containers.
+4.  Create two Docker volumes (`postgres_data` and `chroma_data`) to persist your data.
 
-1.  Install PostgreSQL.
-2.  Create a database.
-3.  Create the tables defined in the schema (see `image.png`).
+The API will be available at `http://localhost:8000`.
 
-### 3. Configure Environment Variables
+### 3. Set Up the Database Tables
 
-Create a `.env` file in the root of the project and add the following environment variables:
-
-```
-DB_USER=your_db_user
-DB_PASSWORD=your_db_password
-DB_HOST=your_db_host
-DB_PORT=your_db_port
-DB_NAME=your_db_name
-TAVILY_API_KEY=your_tavily_api_key
-```
+1.  After starting the containers, you need to create the necessary tables in the PostgreSQL database. You can connect to the database using a client like `psql` or DBeaver with the credentials from your `.env` file.
+2.  Execute the SQL statements required to create the schema shown in `image.png`.
 
 ### 4. Populate the Vector Store
 
-To populate the ChromaDB vector store, place your PDF documents in the `app/data` directory and run the following command:
+1.  Place your PDF documents in the `app/data` directory.
+2.  Run the `populate_database.py` script **inside the running container**:
+    ```bash
+    docker-compose exec api python -m app.populate_database
+    ```
 
-```bash
-python -m app.populate_database
-```
+## Usage
 
-### 5. Run the Server
+### API Endpoints
 
-#### Development
+#### `/query`
 
-```bash
-python main.py
-```
-
-#### Production
-
-```bash
-gunicorn -c gunicorn.conf.py main:app
-```
-
-## API Endpoints
-
-### `/query`
-
-*   **Method:** POST
-*   **Body:**
+-   **Method:** POST
+-   **URL:** `http://localhost:8000/query`
+-   **Body:**
     ```json
     {
         "prompt": "Your query here"
     }
     ```
-*   **Response:**
-    ```json
-    {
-        "answer": "The answer to your query.",
-        "sources": ["source1.pdf", "source2.pdf"],
-        "web_urls": ["url1", "url2"],
-        "rewritten_question": "The rewritten question.",
-        "relevance_check": "yes" | "no",
-        "confidence": "high" | "low",
-        "sql_result": [...]
-    }
-    ```
 
-### `/upload`
+#### `/upload`
 
-*   **Method:** POST
-*   **Body:**
-    ```
-    multipart/form-data
-    ```
-    with a `file` field containing the PDF file to upload.
-*   **Response:**
-    ```json
-    {
-        "message": "File uploaded successfully.",
-        "file_path": "app/data/your_file.pdf"
-    }
-    ```
+-   **Method:** POST
+-   **URL:** `http://localhost:8000/upload`
+-   **Body:** `multipart/form-data` with a `file` field.
+
+## Stopping the Application
+
+To stop the containers, press `Ctrl+C` in the terminal where `docker-compose` is running, or run:
+
+```bash
+docker-compose down
+```
