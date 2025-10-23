@@ -112,3 +112,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+# Volumes of docker containers
+postgres_data/
+ollama_data/

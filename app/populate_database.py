@@ -3,12 +3,12 @@ import os
 import shutil
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.schema.document import Document
+from langchain_core.documents import Document
 from get_embedding_function import get_embedding_function
 from langchain_chroma import Chroma
 
-CHROMA_PATH = "chroma"
-DATA_PATH = "data"
+CHROMA_PATH = "app/chroma"
+DATA_PATH = "app/data"
 
 
 def main():
@@ -48,7 +48,7 @@ def add_to_chroma(chunks: list[Document]):
     db = Chroma(
         persist_directory=CHROMA_PATH, embedding_function=get_embedding_function()
     )
-
+    
     # Calculate Page IDs.
     chunks_with_ids = calculate_chunk_ids(chunks)
 

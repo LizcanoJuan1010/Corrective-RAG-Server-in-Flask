@@ -21,8 +21,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constantes
-CHROMA_PATH = "./app/chroma"
-DEFAULT_MODEL = "phi4"
+CHROMA_PATH = "app/chroma"
+DEFAULT_MODEL = "gemma3:4b"
 
 PROMPT_TEMPLATE = """
 Answer the question based only on the following context:
@@ -184,23 +184,41 @@ def process_query(query_text: str) -> dict:
         sql_result = sql_agent_executor.invoke({"input": improved_question})
         logger.info(f"Paso 2 (Consulta SQL) completado en {time.time() - step_start_time:.2f} segundos")
 
-        # 3. Recuperar documentos relevantes y filtrar por licitacion_id
+        # 3. Definir el retriever (filtrado o no) BASADO en el resultado del SQL
         step_start_time = time.time()
-        retriever = components["retriever"]
         if sql_result:
+            logger.info(f"Filtrando búsqueda vectorial por {len(sql_result)} IDs de licitación.")
             retriever = components["vector_db"].as_retriever(
                 search_kwargs={"k": 10, "filter": {"licitacion_id": {"$in": sql_result}}}
             )
-        docs = retriever.invoke(improved_question)
-        logger.info(f"Paso 3 (Recuperación de documentos) completado en {time.time() - step_start_time:.2f} segundos")
+        else:
+            logger.info("No hay filtro SQL, usando retriever por defecto.")
+            retriever = components["retriever"] # Usa el retriever por defecto k=4
 
-        # 4. Evaluar relevancia de documentos con manejo de errores
+        # 4. Búsqueda en paralelo (Vectorial + Web)
+        #    Esta es AHORA la única llamada de recuperación.
+        parallel_retrieval = RunnableParallel(
+            docs=retriever,
+            web_results=components["web_search_tool"]
+        )
+        
+        try:
+            retrieved_data = parallel_retrieval.invoke(improved_question)
+        except Exception as e:
+            logger.error(f"Error durante la búsqueda en paralelo: {e}")
+            retrieved_data = {"docs": retriever.invoke(improved_question), "web_results": []}
+
+        docs = retrieved_data["docs"]
+        logger.info(f"Paso 3 y 4 (Recuperación y Búsqueda Web) completado en {time.time() - step_start_time:.2f} segundos")
+
+
+        # 5. Evaluar relevancia de documentos
         step_start_time = time.time()
         relevance_result = components["retrieval_grader"].invoke({
             "document": docs[0].page_content if docs else "No hay documentos",
             "question": improved_question
         })
-        logger.info(f"Paso 4 (Evaluación de relevancia) completado en {time.time() - step_start_time:.2f} segundos")
+        logger.info(f"Paso 5 (Evaluación de relevancia) completado en {time.time() - step_start_time:.2f} segundos")
 
         try:
             relevance = RetrievalEvaluator(**relevance_result)
@@ -208,33 +226,16 @@ def process_query(query_text: str) -> dict:
             logger.error(f"Error validando evaluación: {e}")
             relevance = RetrievalEvaluator(binary_score="no")
 
-        # 5. Búsqueda en paralelo y generación de respuesta
+        # 6. Generación de respuesta final
         step_start_time = time.time()
-
-        # Define el paso de recuperación en paralelo
-        parallel_retrieval = RunnableParallel(
-            docs=retriever,
-            web_results=components["web_search_tool"]
-        )
-
-        # Invoca la cadena paralela y luego la cadena de respuesta
-        try:
-            retrieved_data = parallel_retrieval.invoke(improved_question)
-        except Exception as e:
-            logger.error(f"Error durante la búsqueda en paralelo: {e}")
-            # Si la búsqueda en paralelo falla, intenta al menos obtener los documentos
-            retrieved_data = {"docs": retriever.invoke(improved_question), "web_results": []}
-
         final_answer = components["answer_chain"].invoke({
             "question": improved_question,
-            "docs": retrieved_data["docs"],
+            "docs": docs, # Usamos los 'docs' recuperados
             "web_results": retrieved_data["web_results"]
         })
-
-        logger.info(f"Paso 5 (Búsqueda en paralelo y generación de respuesta) completado en {time.time() - step_start_time:.2f} segundos")
+        logger.info(f"Paso 6 (Generación de respuesta) completado en {time.time() - step_start_time:.2f} segundos")
 
         web_results = retrieved_data["web_results"]
-
         logger.info(f"Consulta completa procesada en {time.time() - start_time:.2f} segundos")
 
         web_urls = list({res.get('url') for res in web_results if res.get('url')})

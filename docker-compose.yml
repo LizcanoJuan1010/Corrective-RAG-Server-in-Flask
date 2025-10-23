@@ -12,6 +12,10 @@ services:
       - .env
     depends_on:
       - db
+      - ollama  
+    environment:
+
+      - OLLAMA_BASE_URL=http://ollama:11434
 
   db:
     image: postgres:15
@@ -24,6 +28,15 @@ services:
     ports:
       - "5432:5432"
 
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+    
+      - "11434:11434"
+
 volumes:
   postgres_data:
   chroma_data:
+  ollama_data:  
