@@ -1,6 +1,7 @@
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities.sql_database import SQLDatabase
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from .db_utils import get_db_engine
 import logging
@@ -12,45 +13,64 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "gemma3:4b"
 EMBEDDING_MODEL = "nomic-embed-text"
 
-# --- Plantilla de Prompt para el Agente SQL con pgvector ---
-SQL_PROMPT_TEMPLATE = """
-Eres un experto en PostgreSQL que trabaja con LangChain. Tu tarea es interactuar con una base de datos que contiene información sobre licitaciones y chunks de documentos.
+# --- Plantilla de Prompt para el Agente SQL con pgvector y esquema complejo ---
+# Se reestructura el prompt para usar el formato de mensajes de LangChain
+SYSTEM_PROMPT = """
+Eres un asistente experto en PostgreSQL que trabaja con LangChain. Tu tarea es generar consultas SQL para una base de datos de licitaciones.
 
-**Capacidades de la Base de Datos:**
-1.  **Búsqueda Semántica con pgvector:** La tabla `chunks` contiene una columna `texto_embedding` de tipo `vector`. Puedes realizar búsquedas de similitud semántica utilizando el operador `<=>` (distancia coseno).
-2.  **Relaciones entre Tablas:**
-    *   La tabla `licitaciones` contiene información general (`id`, `nombre_licitacion`).
-    *   La tabla `chunks` contiene fragmentos de texto (`id`, `id_licitacion`, `texto`, `texto_embedding`).
-    *   Puedes unir (`JOIN`) estas tablas usando `licitaciones.id = chunks.id_licitacion`.
+**Esquema de la Base de Datos:**
+
+1.  `licitacion`: Contiene los detalles principales de cada licitación.
+    *   `id`, `entidad`, `objeto`, `cuantia`, `modalidad`, `numero`, `estado`, `fecha_public`, `ubicacion`, `act_econ`, `enlace`, `portal_origen`.
+    *   `nombre_licitacion_embedding` (VECTOR): Embedding del título/objeto de la licitación para búsqueda semántica.
+    *   `texto_indexado` (TEXT): El texto completo usado para generar el embedding anterior.
+
+2.  `chunks`: Contiene fragmentos de texto detallados de los documentos de la licitación.
+    *   `id`, `licitacion_id` (se une a `licitacion.id`), `texto`, `embedding` (VECTOR).
+
+3.  `flags`: Describe diferentes tipos de "banderas" o alertas (ej. riesgos, condiciones especiales).
+    *   `id`, `codigo`, `nombre`, `descripcion`.
+
+4.  `flags_licitaciones`: Tabla de unión que indica qué flags tiene cada licitación.
+    *   `id`, `licitacion_id` (se une a `licitacion.id`), `flag_id` (se une a `flags.id`), `valor` (BOOLEAN).
+
+5.  `flags_log`: Un registro de auditoría de los cambios en los flags.
 
 **Instrucciones para Generar Consultas:**
 
-1.  **Genera una consulta SQL válida** para PostgreSQL.
-2.  **Utiliza el embedding proporcionado:** En lugar de generar un embedding, utiliza el vector que te proporciono en el parámetro `user_question_embedding`. Insértalo directamente en la consulta.
-    *   **Ejemplo:** `ORDER BY texto_embedding <=> '{user_question_embedding}'`
-3.  **Combina filtros y búsqueda semántica:** Si la pregunta del usuario menciona un nombre o ID de licitación, usa una cláusula `WHERE` y luego ordena por similitud semántica.
-    *   **Ejemplo con JOIN:**
+1.  **Genera una única consulta SQL válida** para PostgreSQL.
+2.  **Búsqueda Semántica:** Para preguntas abiertas sobre el contenido, prioriza la búsqueda en la tabla `chunks`. Para preguntas sobre el objeto o título de una licitación, usa `nombre_licitacion_embedding`.
+    *   Utiliza el operador `<=>` (distancia coseno) y el embedding de la pregunta del usuario proporcionado en `{user_question_embedding}`.
+    *   **Ejemplo:** `ORDER BY chunks.embedding <=> '{user_question_embedding}'`
+3.  **Consultas con Filtros y Uniones (JOINs):**
+    *   Si el usuario pregunta por una licitación con un "flag" específico, debes unir `licitacion` con `flags_licitaciones` y `flags`.
+    *   **Ejemplo:** "Encuentra licitaciones con el flag 'red1'":
         ```sql
-        SELECT chunks.texto
-        FROM licitaciones
-        JOIN chunks ON licitaciones.id = chunks.id_licitacion
-        WHERE licitaciones.nombre_licitacion LIKE '%nombre específico%'
-        ORDER BY chunks.texto_embedding <=> '{user_question_embedding}'
-        LIMIT 5;
+        SELECT l.objeto FROM licitacion l
+        JOIN flags_licitaciones fl ON l.id = fl.licitacion_id
+        JOIN flags f ON fl.flag_id = f.id
+        WHERE f.codigo = 'red1' AND fl.valor = TRUE;
         ```
-4.  **Devuelve el texto:** Asegúrate de que tu consulta final seleccione la columna `chunks.texto` y limita los resultados (`LIMIT 5`).
-
-Aquí tienes la pregunta del usuario:
-{input}
+    *   Si se pide buscar texto dentro de licitaciones con un flag, une las tres tablas y además `chunks`, combinando `WHERE` con `ORDER BY` semántico.
+4.  **Selecciona Columnas Relevantes:** Devuelve las columnas que respondan mejor a la pregunta. Si es una pregunta general, `licitacion.objeto` o `chunks.texto` suelen ser las más útiles.
+5.  **Limita los resultados** a un número razonable (ej. `LIMIT 10`).
 """
 
 def create_sql_agent_executor():
-    """Crea y devuelve un agente SQL de LangChain configurado para pgvector."""
+    """Crea y devuelve un agente SQL de LangChain configurado para el nuevo esquema."""
     db_engine = get_db_engine()
-    db = SQLDatabase(engine=db_engine, include_tables=['licitaciones', 'chunks'])
+    # Incluimos todas las tablas relevantes para que el agente las conozca
+    include_tables = ['licitacion', 'chunks', 'flags', 'flags_licitaciones', 'flags_log']
+    db = SQLDatabase(engine=db_engine, include_tables=include_tables)
+
     llm = OllamaLLM(model=DEFAULT_MODEL, temperature=0)
 
-    prompt = ChatPromptTemplate.from_template(SQL_PROMPT_TEMPLATE)
+    # Construcción del prompt con el placeholder requerido
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content="{input}\n\nEmbedding de la pregunta para usar en la consulta:\n{user_question_embedding}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
 
     agent_executor = create_sql_agent(
         llm=llm,
@@ -74,20 +94,16 @@ def get_components():
     return _agent_executor, _embedding_function
 
 def process_query(query_text: str) -> dict:
-    """
-    Procesa la consulta del usuario utilizando un agente SQL.
-    """
+    """Procesa la consulta del usuario utilizando un agente SQL avanzado."""
     try:
         logger.info(f"Procesando consulta: {query_text}")
         agent_executor, embedding_function = get_components()
         
-        # 1. Generar el embedding de la pregunta del usuario
         query_embedding = embedding_function.embed_query(query_text)
 
-        # 2. Invocar al agente con la pregunta y el embedding precalculado
         result = agent_executor.invoke({
             "input": query_text,
-            "user_question_embedding": str(query_embedding) # Pasar como string
+            "user_question_embedding": str(query_embedding),
         })
 
         return {
