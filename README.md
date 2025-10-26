@@ -1,89 +1,86 @@
-# Corrective-RAG-Server-in-Flask
+# Servidor RAG Correctivo en Flask
 
-This project is a Flask-based server that implements a hybrid RAG (Retrieval-Augmented Generation) system. It can query both a PostgreSQL database for structured data and a ChromaDB vector store for unstructured data. This project is fully containerized with Docker for easy setup and deployment.
+Este proyecto es un servidor basado en Flask que implementa un sistema RAG (Generación Aumentada por Recuperación) híbrido. Utiliza un Agente SQL de LangChain para realizar consultas que pueden combinar filtros SQL estándar con búsquedas semánticas vectoriales en una base de datos PostgreSQL con la extensión `pgvector`. El sistema está completamente contenedorizado con Docker para facilitar su configuración y despliegue.
 
-## Prerequisites
+## Prerrequisitos
 
 -   Docker
 -   Docker Compose
+-   `sudo` o permisos de administrador para ejecutar comandos de Docker.
 
-## Setup
+## Configuración
 
-### 1. Configure Environment Variables
+### 1. Coloca el Respaldo de la Base de Datos
 
-1.  Create a file named `.env` in the root of the project by copying the example file:
+-   Consigue el archivo de respaldo de la base de datos que deseas restaurar.
+-   Renombra el archivo a `backup.dump`.
+-   Coloca este archivo en el **directorio raíz del proyecto**, al mismo nivel que `docker-compose.yml`.
+
+### 2. Configura las Variables de Entorno
+
+1.  Crea un archivo llamado `.env` en la raíz del proyecto. Puedes hacerlo copiando el archivo de ejemplo:
     ```bash
     cp .env.example .env
     ```
-2.  Open the `.env` file and **edit the variables** to match your desired configuration. At a minimum, you must set `TAVILY_API_KEY`. The database credentials will be used by Docker Compose to initialize the PostgreSQL container.
+2.  Abre el archivo `.env` con un editor de texto. Deberás configurar las siguientes variables:
 
     ```
-    # PostgreSQL Settings
+    # Configuración de PostgreSQL
     DB_USER=user
     DB_PASSWORD=password
     DB_HOST=db
     DB_PORT=5432
     DB_NAME=rag_db
 
-    # Tavily API Key for web search
-    TAVILY_API_KEY=your_tavily_api_key
+    # Clave de API de Tavily (Opcional, para búsqueda web)
+    TAVILY_API_KEY=tu_clave_api_de_tavily
     ```
-    **Note:** The `DB_HOST` must be `db`, which is the service name of the PostgreSQL container in `docker-compose.yml`.
+    **Nota Importante:**
+    -   Los valores `DB_HOST=db` y `DB_PORT=5432` están preconfigurados para la comunicación entre contenedores y **no deben ser modificados**.
+    -   Puedes personalizar `DB_USER`, `DB_PASSWORD`, y `DB_NAME`, pero los valores por defecto funcionarán sin problemas. El sistema usará estas credenciales para inicializar la base de datos.
 
-### 2. Build and Run the Containers
+### 3. Construye y Ejecuta los Contenedores
 
-From the root of the project, run the following command:
+Desde el directorio raíz del proyecto, ejecuta el siguiente comando:
 
 ```bash
-docker-compose up --build
+sudo docker compose up --build -d
 ```
 
-This command will:
-1.  Build the Docker image for the Flask application.
-2.  Download the official PostgreSQL image.
-3.  Start both the application and the database containers.
-4.  Create two Docker volumes (`postgres_data` and `chroma_data`) to persist your data.
+Este comando realizará las siguientes acciones:
+1.  Construirá la imagen Docker para la aplicación Flask.
+2.  Descargará las imágenes oficiales de `pgvector/pgvector` para la base de datos y `ollama/ollama` para el modelo de lenguaje.
+3.  Iniciará todos los servicios (API, base de datos y Ollama).
+4.  **Restaurará automáticamente la base de datos** usando el archivo `backup.dump`.
+5.  Descargará los modelos de IA requeridos (`gemma3:4b` y `nomic-embed-text`) a través del servicio de configuración de Ollama.
+6.  Creará volúmenes de Docker (`postgres_data` y `ollama_data`) para persistir los datos de tu base de datos y los modelos de Ollama.
 
-The API will be available at `http://localhost:8000`.
+Una vez que el comando finalice, la API estará disponible en `http://localhost:8000`.
 
-### 3. Set Up the Database Tables
+## Uso
 
-1.  After starting the containers, you need to create the necessary tables in the PostgreSQL database. You can connect to the database using a client like `psql` or DBeaver with the credentials from your `.env` file.
-2.  Execute the SQL statements required to create the schema shown in `image.png`.
-
-### 4. Populate the Vector Store
-
-1.  Place your PDF documents in the `app/data` directory.
-2.  Run the `populate_database.py` script **inside the running container**:
-    ```bash
-    docker-compose exec api python -m app.populate_database
-    ```
-
-## Usage
-
-### API Endpoints
+### Endpoints de la API
 
 #### `/query`
 
--   **Method:** POST
+-   **Método:** POST
 -   **URL:** `http://localhost:8000/query`
--   **Body:**
+-   **Cuerpo (Body):**
     ```json
     {
-        "prompt": "Your query here"
+        "prompt": "Tu consulta aquí"
     }
     ```
 
-#### `/upload`
+## Cómo Detener la Aplicación
 
--   **Method:** POST
--   **URL:** `http://localhost:8000/upload`
--   **Body:** `multipart/form-data` with a `file` field.
-
-## Stopping the Application
-
-To stop the containers, press `Ctrl+C` in the terminal where `docker-compose` is running, or run:
+Para detener todos los contenedores, ejecuta:
 
 ```bash
-docker-compose down
+sudo docker compose down
+```
+
+Si además deseas eliminar los volúmenes (y con ello, todos los datos persistidos de la base de datos y los modelos de Ollama), utiliza:
+```bash
+sudo docker compose down -v
 ```
