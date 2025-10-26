@@ -21,38 +21,40 @@ Eres un asistente experto en PostgreSQL que trabaja con LangChain. Tu tarea es g
 **Esquema de la Base de Datos:**
 
 1.  `licitacion`: Contiene los detalles principales de cada licitación.
-    *   `id`, `entidad`, `objeto`, `cuantia`, `modalidad`, `numero`, `estado`, `fecha_public`, `ubicacion`, `act_econ`, `enlace`, `portal_origen`.
-    *   `nombre_licitacion_embedding` (VECTOR): Embedding del título/objeto de la licitación para búsqueda semántica.
-    *   `texto_indexado` (TEXT): El texto completo usado para generar el embedding anterior.
+    * `id`, `entidad`, `objeto`, `cuantia`, `modalidad`, `numero`, `estado`, `fecha_public`, `ubicacion`, `act_econ`, `enlace`, `portal_origen`.
+    * `embedding_vec` (VECTOR): Embedding del título/objeto de la licitacin para búsqueda semántica (generado a partir de `texto_indexado`).
+    * `texto_indexado` (TEXT): El texto completo usado para generar el embedding.
 
-2.  `chunks`: Contiene fragmentos de texto detallados de los documentos de la licitación.
-    *   `id`, `licitacion_id` (se une a `licitacion.id`), `texto`, `embedding` (VECTOR).
+2.  `licitacion_chunk`: Contiene fragmentos de texto detallados (chunks) de los documentos de la licitación.
+    * `id`, `licitacion_id` (se une a `licitacion.id`), `chunk_idx` (índice del chunk).
+    * `chunk_text` (TEXT): El texto del fragmento.
+    * `embedding_vec` (VECTOR): Embedding del `chunk_text` para búsqueda semántica.
 
 3.  `flags`: Describe diferentes tipos de "banderas" o alertas (ej. riesgos, condiciones especiales).
-    *   `id`, `codigo`, `nombre`, `descripcion`.
+    * `id`, `codigo`, `nombre`, `descripcion`.
 
 4.  `flags_licitaciones`: Tabla de unión que indica qué flags tiene cada licitación.
-    *   `id`, `licitacion_id` (se une a `licitacion.id`), `flag_id` (se une a `flags.id`), `valor` (BOOLEAN).
+    * `id`, `licitacion_id` (se une a `licitacion.id`), `flag_id` (se une a `flags.id`), `valor` (BOOLEAN).
 
 5.  `flags_log`: Un registro de auditoría de los cambios en los flags.
 
 **Instrucciones para Generar Consultas:**
 
 1.  **Genera una única consulta SQL válida** para PostgreSQL.
-2.  **Búsqueda Semántica:** Para preguntas abiertas sobre el contenido, prioriza la búsqueda en la tabla `chunks`. Para preguntas sobre el objeto o título de una licitación, usa `nombre_licitacion_embedding`.
-    *   Utiliza el operador `<=>` (distancia coseno) y el embedding de la pregunta del usuario proporcionado en `{user_question_embedding}`.
-    *   **Ejemplo:** `ORDER BY chunks.embedding <=> '{user_question_embedding}'`
+2.  **Búsqueda Semántica:** Para preguntas abiertas sobre el contenido, prioriza la búsqueda en la tabla `licitacion_chunk`. Para preguntas sobre el objeto o título de una licitación, usa `licitacion.embedding_vec`.
+    * Utiliza el operador `<=>` (distancia coseno) y el embedding de la pregunta del usuario proporcionado en `{user_question_embedding}`.
+    * **Ejemplo:** `ORDER BY licitacion_chunk.embedding_vec <=> '{user_question_embedding}'`
 3.  **Consultas con Filtros y Uniones (JOINs):**
-    *   Si el usuario pregunta por una licitación con un "flag" específico, debes unir `licitacion` con `flags_licitaciones` y `flags`.
-    *   **Ejemplo:** "Encuentra licitaciones con el flag 'red1'":
+    * Si el usuario pregunta por una licitación con un "flag" específico (ej. 'red1'), debes unir `licitacion` con `flags_licitaciones` y `flags`.
+    * **Ejemplo:** "Encuentra licitaciones con el flag 'red1'":
         ```sql
         SELECT l.objeto FROM licitacion l
         JOIN flags_licitaciones fl ON l.id = fl.licitacion_id
         JOIN flags f ON fl.flag_id = f.id
         WHERE f.codigo = 'red1' AND fl.valor = TRUE;
         ```
-    *   Si se pide buscar texto dentro de licitaciones con un flag, une las tres tablas y además `chunks`, combinando `WHERE` con `ORDER BY` semántico.
-4.  **Selecciona Columnas Relevantes:** Devuelve las columnas que respondan mejor a la pregunta. Si es una pregunta general, `licitacion.objeto` o `chunks.texto` suelen ser las más útiles.
+    * Si se pide buscar texto dentro de licitaciones con un flag, une las tres tablas (`licitacion`, `flags_licitaciones`, `flags`) y además `licitacion_chunk`, combinando `WHERE` con `ORDER BY` semántico.
+4.  **Selecciona Columnas Relevantes:** Devuelve las columnas que respondan mejor a la pregunta. Si es una pregunta general, `licitacion.objeto` o `licitacion_chunk.chunk_text` suelen ser las más útiles.
 5.  **Limita los resultados** a un número razonable (ej. `LIMIT 10`).
 """
 
@@ -60,7 +62,8 @@ def create_sql_agent_executor():
     """Crea y devuelve un agente SQL de LangChain configurado para el nuevo esquema."""
     db_engine = get_db_engine()
     # Incluimos todas las tablas relevantes para que el agente las conozca
-    include_tables = ['licitacion', 'chunks', 'flags', 'flags_licitaciones', 'flags_log']
+    # 'licitacion_chunk' reemplaza a 'chunks'. Omitimos 'licitacion_keymap'.
+    include_tables = ['licitacion', 'licitacion_chunk', 'flags', 'flags_licitaciones', 'flags_log']
     db = SQLDatabase(engine=db_engine, include_tables=include_tables)
 
     llm = OllamaLLM(model=DEFAULT_MODEL, temperature=0)
@@ -103,7 +106,7 @@ def process_query(query_text: str) -> dict:
 
         result = agent_executor.invoke({
             "input": query_text,
-            "user_question_embedding": str(query_embedding),
+            "user_question_embedding": str(query_embedding), # Se pasa como string
         })
 
         return {
