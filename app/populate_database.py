@@ -1,19 +1,17 @@
-import argparse
 import os
-import shutil
+import argparse
 from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from get_embedding_function import get_embedding_function
-from langchain_chroma import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings
+from sqlalchemy import create_engine, text
+from pgvector.sqlalchemy import Vector
+import pandas as pd
+from app.db_utils import get_db_engine
 
-CHROMA_PATH = "app/chroma"
 DATA_PATH = "app/data"
-
+EMBEDDING_MODEL = "nomic-embed-text"
 
 def main():
-
-    # Check if the database should be cleared (using the --clear flag).
     parser = argparse.ArgumentParser()
     parser.add_argument("--reset", action="store_true", help="Reset the database.")
     args = parser.parse_args()
@@ -21,18 +19,36 @@ def main():
         print("✨ Clearing Database")
         clear_database()
 
-    # Create (or update) the data store.
+    # Create schema and tables
+    engine = get_db_engine()
+    with engine.connect() as connection:
+        connection.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
+        connection.execute(text("""
+        CREATE TABLE IF NOT EXISTS licitaciones (
+            id SERIAL PRIMARY KEY,
+            nombre_licitacion VARCHAR(255) UNIQUE
+        )
+        """))
+        connection.execute(text("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id SERIAL PRIMARY KEY,
+            id_licitacion INTEGER REFERENCES licitaciones(id),
+            texto TEXT,
+            texto_embedding VECTOR(768)
+        )
+        """))
+        connection.commit()
+
+    # Load documents and add to database
     documents = load_documents()
     chunks = split_documents(documents)
-    add_to_chroma(chunks)
-
+    add_to_postgres(chunks)
 
 def load_documents():
     document_loader = PyPDFDirectoryLoader(DATA_PATH)
     return document_loader.load()
 
-
-def split_documents(documents: list[Document]):
+def split_documents(documents):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=100,
@@ -42,69 +58,41 @@ def split_documents(documents: list[Document]):
     )
     return text_splitter.split_documents(documents)
 
+def add_to_postgres(chunks):
+    engine = get_db_engine()
+    embedding_function = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
-def add_to_chroma(chunks: list[Document]):
-    # Load the existing database.
-    db = Chroma(
-        persist_directory=CHROMA_PATH, embedding_function=get_embedding_function()
-    )
-    
-    # Calculate Page IDs.
-    chunks_with_ids = calculate_chunk_ids(chunks)
+    with engine.connect() as connection:
+        for chunk in chunks:
+            source = chunk.metadata.get("source")
+            if source:
+                # Insert licitacion if it doesn't exist
+                licitacion_name = os.path.basename(source)
+                res = connection.execute(text("SELECT id FROM licitaciones WHERE nombre_licitacion = :name"), {"name": licitacion_name}).fetchone()
+                if res:
+                    licitacion_id = res[0]
+                else:
+                    result = connection.execute(text("INSERT INTO licitaciones (nombre_licitacion) VALUES (:name) RETURNING id"), {"name": licitacion_name})
+                    licitacion_id = result.fetchone()[0]
 
-    # Add or Update the documents.
-    existing_items = db.get(include=[])  # IDs are always included by default
-    existing_ids = set(existing_items["ids"])
-    print(f"Number of existing documents in DB: {len(existing_ids)}")
-
-    # Only add documents that don't exist in the DB.
-    new_chunks = []
-    for chunk in chunks_with_ids:
-        if chunk.metadata["id"] not in existing_ids:
-            new_chunks.append(chunk)
-
-    if len(new_chunks):
-        print(f"👉 Adding new documents: {len(new_chunks)}")
-        new_chunk_ids = [chunk.metadata["id"] for chunk in new_chunks]
-        db.add_documents(new_chunks, ids=new_chunk_ids)
-
-    else:
-        print("✅ No new documents to add")
-
-
-def calculate_chunk_ids(chunks):
-
-    # This will create IDs like "data/ley-1474-de-2011.pdf:6:2"
-    # Page Source : Page Number : Chunk Index
-
-    last_page_id = None
-    current_chunk_index = 0
-
-    for chunk in chunks:
-        source = chunk.metadata.get("source")
-        page = chunk.metadata.get("page")
-        current_page_id = f"{source}:{page}"
-
-        # If the page ID is the same as the last one, increment the index.
-        if current_page_id == last_page_id:
-            current_chunk_index += 1
-        else:
-            current_chunk_index = 0
-
-        # Calculate the chunk ID.
-        chunk_id = f"{current_page_id}:{current_chunk_index}"
-        last_page_id = current_page_id
-
-        # Add it to the page meta-data.
-        chunk.metadata["id"] = chunk_id
-
-    return chunks
-
+                # Insert chunk
+                embedding = embedding_function.embed_query(chunk.page_content)
+                connection.execute(
+                    text("""
+                    INSERT INTO chunks (id_licitacion, texto, texto_embedding)
+                    VALUES (:id_licitacion, :texto, :embedding)
+                    """),
+                    {"id_licitacion": licitacion_id, "texto": chunk.page_content, "embedding": embedding}
+                )
+        connection.commit()
+    print("✅ Documents added to PostgreSQL")
 
 def clear_database():
-    if os.path.exists(CHROMA_PATH):
-        shutil.rmtree(CHROMA_PATH)
-
+    engine = get_db_engine()
+    with engine.connect() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS chunks CASCADE"))
+        connection.execute(text("DROP TABLE IF EXISTS licitaciones CASCADE"))
+        connection.commit()
 
 if __name__ == "__main__":
     main()
