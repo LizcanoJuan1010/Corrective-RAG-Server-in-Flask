@@ -1,9 +1,8 @@
 pypdf
 langchain
 langchain-community
-langchain-chroma
 langchain-ollama
-chromadb # Vector storage
+pgvector
 pytest
 boto3
 psycopg2-binary
