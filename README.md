@@ -1,6 +1,6 @@
 # Servidor RAG Correctivo en Flask
 
-Este proyecto es un servidor basado en Flask que implementa un sistema RAG (Generación Aumentada por Recuperación) híbrido. Utiliza un Agente SQL de LangChain para realizar consultas que pueden combinar filtros SQL estándar con búsquedas semánticas vectoriales en una base de datos PostgreSQL con la extensión `pgvector`. El sistema está completamente contenedorizado con Docker para facilitar su configuración y despliegue.
+Este proyecto es un servidor basado en Flask que implementa un sistema RAG (Generación Aumentada por Recuperación) híbrido. Utiliza un Agente SQL de LangChain para realizar consultas que pueden combinar filtros SQL estándar con búsquedas semánticas vectoriales en una base de datos PostgreSQL con la extensión `pgvector`. El sistema utiliza la **API de Google Gemini** como modelo de lenguaje y para la generación de embeddings, y está completamente contenedorizado con Docker para facilitar su configuración y despliegue.
 
 ## Prerrequisitos
 
@@ -32,11 +32,15 @@ Este proyecto es un servidor basado en Flask que implementa un sistema RAG (Gene
     DB_PORT=5432
     DB_NAME=rag_db
 
+    # Clave de API de Google Gemini
+    GEMINI_API_KEY=tu_clave_api_de_gemini
+
     # Clave de API de Tavily (Opcional, para búsqueda web)
     TAVILY_API_KEY=tu_clave_api_de_tavily
     ```
     **Nota Importante:**
     -   Los valores `DB_HOST=db` y `DB_PORT=5432` están preconfigurados para la comunicación entre contenedores y **no deben ser modificados**.
+    -   Debes proporcionar tu propia `GEMINI_API_KEY` para que la aplicación pueda conectarse a los servicios de Google.
     -   Puedes personalizar `DB_USER`, `DB_PASSWORD`, y `DB_NAME`, pero los valores por defecto funcionarán sin problemas. El sistema usará estas credenciales para inicializar la base de datos.
 
 ### 3. Construye y Ejecuta los Contenedores
@@ -49,11 +53,10 @@ sudo docker compose up --build -d
 
 Este comando realizará las siguientes acciones:
 1.  Construirá la imagen Docker para la aplicación Flask.
-2.  Descargará las imágenes oficiales de `pgvector/pgvector` para la base de datos y `ollama/ollama` para el modelo de lenguaje.
-3.  Iniciará todos los servicios (API, base de datos y Ollama).
+2.  Descargará la imagen oficial de `pgvector/pgvector` para la base de datos.
+3.  Iniciará todos los servicios (API y base de datos).
 4.  **Restaurará automáticamente la base de datos** usando el archivo `backup.dump`.
-5.  Descargará los modelos de IA requeridos (`gemma3:4b` y `nomic-embed-text`) a través del servicio de configuración de Ollama.
-6.  Creará volúmenes de Docker (`postgres_data` y `ollama_data`) para persistir los datos de tu base de datos y los modelos de Ollama.
+5.  Creará un volumen de Docker (`postgres_data`) para persistir los datos de tu base de datos.
 
 Una vez que el comando finalice, la API estará disponible en `http://localhost:8000`.
 
@@ -80,7 +83,7 @@ Para detener todos los contenedores, ejecuta:
 sudo docker compose down
 ```
 
-Si además deseas eliminar los volúmenes (y con ello, todos los datos persistidos de la base de datos y los modelos de Ollama), utiliza:
+Si además deseas eliminar el volumen (y con ello, todos los datos persistidos de la base de datos), utiliza:
 ```bash
 sudo docker compose down -v
 ```
