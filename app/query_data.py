@@ -2,19 +2,23 @@ from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from .db_utils import get_db_engine
 import logging
+import os
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemma3:4b"
-EMBEDDING_MODEL = "nomic-embed-text"
+# Asegúrate de que la API key de Gemini esté configurada
+if "GEMINI_API_KEY" not in os.environ:
+    raise ValueError("La variable de entorno GEMINI_API_KEY no está configurada.")
+
+DEFAULT_MODEL = "gemini-2.5-flash"
+EMBEDDING_MODEL = "text-embedding-004"
 
 # --- Plantilla de Prompt para el Agente SQL con pgvector y esquema complejo ---
-# Se reestructura el prompt para usar el formato de mensajes de LangChain
 SYSTEM_PROMPT = """
 Eres un asistente experto en PostgreSQL que trabaja con LangChain. Tu tarea es generar consultas SQL para una base de datos de licitaciones.
 
@@ -61,12 +65,10 @@ Eres un asistente experto en PostgreSQL que trabaja con LangChain. Tu tarea es g
 def create_sql_agent_executor():
     """Crea y devuelve un agente SQL de LangChain configurado para el nuevo esquema."""
     db_engine = get_db_engine()
-    # Incluimos todas las tablas relevantes para que el agente las conozca
-    # 'licitacion_chunk' reemplaza a 'chunks'. Omitimos 'licitacion_keymap'.
     include_tables = ['licitacion', 'licitacion_chunk', 'flags', 'flags_licitaciones', 'flags_log']
     db = SQLDatabase(engine=db_engine, include_tables=include_tables)
 
-    llm = OllamaLLM(model=DEFAULT_MODEL, temperature=0)
+    llm = ChatGoogleGenerativeAI(model=DEFAULT_MODEL, temperature=0, convert_system_message_to_human=True)
 
     # Construcción del prompt con el placeholder requerido
     prompt = ChatPromptTemplate.from_messages([
@@ -93,7 +95,7 @@ def get_components():
     if _agent_executor is None:
         _agent_executor = create_sql_agent_executor()
     if _embedding_function is None:
-        _embedding_function = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        _embedding_function = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     return _agent_executor, _embedding_function
 
 def process_query(query_text: str) -> dict:

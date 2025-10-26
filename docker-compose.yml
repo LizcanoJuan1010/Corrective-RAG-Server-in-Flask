@@ -12,9 +12,6 @@ services:
       - .env
     depends_on:
       - db
-      - ollama
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
     networks:
       - app-network
 
@@ -34,41 +31,8 @@ services:
     networks:
       - app-network
 
-  ollama:
-    image: ollama/ollama
-    restart: unless-stopped
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
-    networks:
-      - app-network
-
-  ollama-setup:
-    image: ollama/ollama
-    restart: "no"
-    depends_on:
-      - ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    command: >
-      sh -c "
-        echo 'Waiting for Ollama to be ready...'
-        while ! wget -q -O - http://ollama:11434/api/tags > /dev/null 2>&1; do
-          sleep 1
-        done
-        echo 'Ollama is ready. Pulling models...'
-        ollama pull gemma3:4b && ollama pull nomic-embed-text
-        echo 'Models pulled successfully.'
-      "
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-    networks:
-      - app-network
-
 volumes:
   postgres_data:
-  ollama_data:
 
 networks:
   app-network:
