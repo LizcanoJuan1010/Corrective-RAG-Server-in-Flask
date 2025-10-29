@@ -1,14 +1,26 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Imprime un mensaje indicando que el script de restauración ha comenzado.
-echo ">>>>> Iniciando la restauración de la base de datos desde el archivo de respaldo..."
+echo "[init] Iniciando restauración…"
 
-# Utiliza psql para cargar los datos desde un dump de texto plano.
-# El archivo backup.dump estará disponible en este directorio gracias al montaje de Docker.
-# psql es la herramienta adecuada para restaurar backups de SQL en formato de texto.
-# Usamos las variables de entorno estándar que la imagen de postgres provee.
-psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/backup.dump
+# Asegura que exista la BD destino
+createdb -U "$POSTGRES_USER" "$POSTGRES_DB" || true
 
-# Imprime un mensaje de éxito una vez completada la restauración.
-echo ">>>>> Restauración de la base de datos completada con éxito."
+if [ -f /docker-entrypoint-initdb.d/backup.dump ]; then
+  echo "[init] Encontrado backup.dump, restaurando con pg_restore…"
+  # --clean/--if-exists eliminan objetos antes de recrearlos
+  # -j paraleliza si el dump fue generado con -Fd (dir); si es -Fc, deja -j en 4 igual
+  pg_restore \
+    -U "$POSTGRES_USER" \
+    -d "$POSTGRES_DB" \
+    --clean --if-exists \
+    -j 4 \
+    /docker-entrypoint-initdb.d/backup.dump
+
+  echo "[init] Restauración finalizada."
+else
+  echo "[init][WARN] No se encontró /docker-entrypoint-initdb.d/backup.dump"
+fi
+
+# Habilita la extensión vector (si no vino en el dump)
+psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"

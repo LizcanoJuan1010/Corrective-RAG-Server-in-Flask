@@ -21,7 +21,7 @@ max_requests = 1000
 max_requests_jitter = 50
 
 # The timeout for workers.
-timeout = 30
+timeout = 1200
 
 # The log level.
 loglevel = "info"
