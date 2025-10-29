@@ -1,10 +1,12 @@
 # app/query_data.py
 # -*- coding: utf-8 -*-
 """
-Módulo que construye un agente Text-to-SQL sobre PostgreSQL + pgvector.
-- Usa LangChain + Gemini (chat + embeddings 1024d).
+Agente Text-to-SQL sobre PostgreSQL + pgvector usando LangChain + Gemini.
+
 - Conecta a la BD vía SQLAlchemy (engine provisto por get_db_engine()).
-- Expone process_query() que recibe una pregunta en texto y devuelve una respuesta limpia.
+- Genera y ejecuta UNA consulta SQL por pregunta.
+- Evita respuestas genéricas y siempre responde con base en resultados.
+- Devuelve, además del texto final, las consultas SQL detectadas.
 
 Requisitos en .env:
   GEMINI_API_KEY=...
@@ -18,8 +20,9 @@ Requisitos en .env:
 from __future__ import annotations
 
 import os
+import json
 import logging
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities.sql_database import SQLDatabase
@@ -34,24 +37,21 @@ from .db_utils import get_db_engine
 
 
 # ---------------------------------------------------------------------------
-# Logging básico
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Config de modelos
+# Modelos
 # ---------------------------------------------------------------------------
 if "GEMINI_API_KEY" not in os.environ:
     raise ValueError("La variable de entorno GEMINI_API_KEY no está configurada.")
 
-# Modelo conversacional (rápido y con tool-calling)
 DEFAULT_MODEL = "gemini-2.5-flash"
-
-# Embeddings (salida 1024-d para que coincida con vector(1024))
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-EMBED_DIM = 1024  # ¡Debe coincidir con vector(1024) en la BD!
+EMBED_DIM = 1024  # Debe coincidir con vector(1024) en la BD
 
 
 # ---------------------------------------------------------------------------
@@ -60,108 +60,127 @@ EMBED_DIM = 1024  # ¡Debe coincidir con vector(1024) en la BD!
 SYSTEM_PROMPT = """
 Eres un asistente experto en PostgreSQL trabajando con LangChain.
 
-TAREA:
-1) Recibirás una pregunta del usuario (en {input}).
-2) Genera UNA sola consulta SQL válida para PostgreSQL que responda la pregunta usando las tablas disponibles.
-3) Ejecuta la consulta.
-4) Responde en lenguaje natural basándote ESTRICTAMENTE en los resultados de esa consulta (no muestres el SQL).
+OBJETIVO (OBLIGATORIO):
+- Para cada pregunta del usuario, DEBES generar y ejecutar UNA única consulta SQL válida
+  para PostgreSQL usando únicamente las tablas y columnas reales disponibles.
+- La respuesta final debe estar basada ESTRICTAMENTE en los resultados de esa consulta.
+- No muestres la consulta SQL en la respuesta final.
+- Si la consulta devuelve 0 filas, dilo explícitamente (sin inventar datos).
 
-REGLAS:
-- Si la consulta devuelve 0 filas, dilo explícitamente.
-- No inventes datos ni hagas suposiciones fuera de los resultados obtenidos.
-- No reveles la consulta SQL generada.
-- Usa nombres de tabla y columna reales (ver esquema abajo).
-- Prioriza consultas eficientes (usa índices cuando existan).
+REGLAS IMPORTANTES:
+- Nunca pidas al usuario que reformule la pregunta: decide y ejecuta.
+- Si el usuario pide “resumen por …” o “distribución por …”, usa GROUP BY sobre las columnas
+  solicitadas y calcula COUNT, SUM, AVG y, si se pide mediana, usa:
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cuantia).
+- Para filtros por estado/fecha/entidad, consulta directamente public.licitacion.
+- Para búsqueda semántica en texto, puedes ordenar por similitud coseno con el índice ivfflat:
+    ORDER BY public.licitacion_chunk.embedding_vec <=> [VECTOR_1024D]  LIMIT 10
+  (usa el operador `<=>` con vector_cosine_ops). Solo hazlo cuando la pregunta lo indique.
 
-ESQUEMA (nombres reales):
-- public.licitacion (
-    id, entidad, objeto, cuantia, modalidad, numero, estado,
-    fecha_public, ubicacion, act_econ, enlace, portal_origen,
-    texto_indexado, embedding, objeto_vec vector(1024)
-  )
-
-- public.licitacion_chunk (
-    id, licitacion_id, chunk_idx, chunk_text,
-    embedding, embedding_vec vector(1024)
-  )
-
+ESQUEMA DISPONIBLE (nombres reales):
+- public.licitacion: id, entidad, objeto, cuantia, modalidad, numero, estado,
+  fecha_public, ubicacion, act_econ, enlace, portal_origen, texto_indexado,
+  embedding, objeto_vec (vector(1024))
+- public.licitacion_chunk: id, licitacion_id, chunk_idx, chunk_text,
+  embedding, embedding_vec (vector(1024))
 - public.flags, public.flags_licitaciones, public.flags_log
 - Otras: public.chunks, public.documents, public.doc_section_hits,
          public.document_text_samples, public.licitacion_keymap
 
-GUÍA PARA CONSULTAS:
-- Búsqueda semántica: si la pregunta es abierta ("¿de qué trata...?",
-  "busca info sobre..."), considera ordenar por similitud coseno
-  usando el índice IVFFlat:
-    ORDER BY public.licitacion_chunk.embedding_vec <=> '[VECTOR_1024D]'
-    LIMIT 10
-  (usa el operador de distancia coseno `<=>` con vector_cosine_ops).
-
-- Si piden por flags/alertas específicos, une licitacion ↔ flags_licitaciones ↔ flags.
-
-- Para preguntas simples (conteos, filtros por estado/fecha/entidad), consulta
-  directamente public.licitacion (usa índices por estado/fecha si existen).
-
-- Devuelve SIEMPRE una respuesta narrativa basada en los datos obtenidos, no el SQL.
+FORMATO DE TRABAJO:
+- Piensa brevemente, genera la consulta SQL, ejecútala y resume los hallazgos.
+- No inventes conclusiones fuera de los datos devueltos.
 """
 
 
 # ---------------------------------------------------------------------------
-# Helper: normaliza la salida del modelo a texto limpio
+# Helpers
 # ---------------------------------------------------------------------------
 def _to_text(x: Any) -> str:
-    """
-    Convierte la salida (que a veces es lista/dict con 'text' o 'extras')
-    a un string limpio. Evita que aparezcan campos como "extras/signature".
-    """
+    """Normaliza la salida del LLM a texto (sin 'extras/signature')."""
     if x is None:
         return ""
     if isinstance(x, str):
         return x
-
-    # Listas de partes (LangChain/Gemini puede devolver múltiples "content parts")
     if isinstance(x, list):
-        parts = []
+        out: List[str] = []
         for p in x:
             if isinstance(p, dict):
                 if "text" in p:
-                    parts.append(p["text"])
+                    out.append(str(p["text"]))
                 elif p.get("type") == "text" and "text" in p:
-                    parts.append(p["text"])
-                else:
-                    # Evita volcar "extras" poco útiles
-                    val = p.get("text") or ""
-                    if val:
-                        parts.append(val)
+                    out.append(str(p["text"]))
             else:
-                parts.append(str(p))
-        return " ".join([s for s in parts if s]).strip()
-
-    # Diccionarios (algunos wrappers devuelven {"type":"text","text":"..."})
+                out.append(str(p))
+        return " ".join(s for s in out if s).strip()
     if isinstance(x, dict):
         if x.get("type") == "text" and "text" in x:
-            return x["text"]
+            return str(x["text"])
         if "output" in x:
             return _to_text(x["output"])
-        # Como último recurso, intenta acceder a un campo 'text'
         if "text" in x:
             return str(x["text"])
-
     return str(x)
 
 
+def _extract_sql_steps(result: Any) -> List[str]:
+    """
+    Intenta extraer consultas SQL desde 'intermediate_steps' en distintos formatos.
+    Es tolerante a versiones de LangChain.
+    """
+    sqls: List[str] = []
+    if not isinstance(result, dict):
+        return sqls
+
+    steps = result.get("intermediate_steps")
+    if not steps:
+        return sqls
+
+    for step in steps:
+        try:
+            # Formato típico: (action, observation)
+            action, _obs = step
+            # action puede ser una estructura con .tool_input o un dict
+            ti = getattr(action, "tool_input", None)
+            if ti is None and isinstance(action, dict):
+                ti = action.get("tool_input") or action.get("input")
+            if ti:
+                sqls.append(str(ti))
+                continue
+        except Exception:
+            pass
+        # Último recurso: stringify del step
+        try:
+            s = json.dumps(step, ensure_ascii=False)
+        except Exception:
+            s = str(step)
+        sqls.append(s)
+    return sqls
+
+
+def _looks_semantic_query(q: str) -> bool:
+    """
+    Heurística simple: activa embedding sólo si la intención parece semántica.
+    Evita confundir al planner en consultas puramente tabulares.
+    """
+    ql = q.lower()
+    keywords = [
+        "similar", "semejante", "parecido", "semántic", "buscar texto",
+        "snippet", "de qué trata", "contenido", "chunk", "embedding", "vector",
+        "relacionado con", "parecidas a", "similar a"
+    ]
+    return any(k in ql for k in keywords)
+
+
 # ---------------------------------------------------------------------------
-# Construcción del agente SQL
+# Construcción del agente
 # ---------------------------------------------------------------------------
 def create_sql_agent_executor():
     """
-    Crea y devuelve un agente SQL LangChain configurado para tu esquema real.
-    - Conecta vía SQLAlchemy.
-    - Limita el contexto a tablas relevantes para reducir alucinaciones.
+    Crea el agente SQL con tool-calling real y prompt estricto para evitar respuestas genéricas.
+    Hace fallback automático a 'openai-tools' si la versión no soporta 'tool-calling'.
     """
     db_engine = get_db_engine()
-
-    # Tablas reales (sin prefijo "public_")
     include_tables = [
         "licitacion",
         "licitacion_chunk",
@@ -174,18 +193,14 @@ def create_sql_agent_executor():
         "document_text_samples",
         "licitacion_keymap",
     ]
-
-    # SQLDatabase le da al agente el esquema y ejecuta las queries
     db = SQLDatabase(engine=db_engine, include_tables=include_tables)
 
-    # LLM conversacional
     llm = ChatGoogleGenerativeAI(
         model=DEFAULT_MODEL,
         temperature=0,
         convert_system_message_to_human=True,
     )
 
-    # Prompt (system + user + scratchpad)
     prompt = ChatPromptTemplate.from_messages(
         [
             SystemMessage(content=SYSTEM_PROMPT),
@@ -194,34 +209,52 @@ def create_sql_agent_executor():
         ]
     )
 
-    # Agente orientado a herramientas SQL (tool-calling/openai-tools)
-    agent_executor = create_sql_agent(
-        llm=llm,
-        db=db,
-        agent_type="openai-tools",
-        verbose=True,
-        prompt=prompt,
-    )
-
-    return agent_executor
+    # Intento 1: tool-calling con pasos intermedios
+    try:
+        agent = create_sql_agent(
+            llm=llm,
+            db=db,
+            agent_type="tool-calling",
+            verbose=True,
+            prompt=prompt,
+            return_intermediate_steps=True,  # algunas versiones lo aceptan
+        )
+        return agent
+    except TypeError:
+        logger.warning("create_sql_agent no acepta return_intermediate_steps con 'tool-calling'. Reintentando sin ese argumento…")
+        try:
+            agent = create_sql_agent(
+                llm=llm,
+                db=db,
+                agent_type="tool-calling",
+                verbose=True,
+                prompt=prompt,
+            )
+            return agent
+        except Exception:
+            logger.warning("Fallback a agent_type='openai-tools'.")
+            agent = create_sql_agent(
+                llm=llm,
+                db=db,
+                agent_type="openai-tools",
+                verbose=True,
+                prompt=prompt,
+            )
+            return agent
 
 
 # ---------------------------------------------------------------------------
-# Inicialización perezosa de componentes
+# Componentes (lazy)
 # ---------------------------------------------------------------------------
 _agent_executor = None
 _embedding_function = None
 
 
 def get_components() -> Tuple[Any, GoogleGenerativeAIEmbeddings]:
-    """
-    Devuelve (agente, embedding_function) inicializándolos una sola vez.
-    """
     global _agent_executor, _embedding_function
     if _agent_executor is None:
         _agent_executor = create_sql_agent_executor()
     if _embedding_function is None:
-        # ¡IMPORTANTE!: salida de dimensión 1024 para que coincida con vector(1024)
         _embedding_function = GoogleGenerativeAIEmbeddings(
             model=EMBEDDING_MODEL,
             output_dimensionality=EMBED_DIM,
@@ -230,52 +263,51 @@ def get_components() -> Tuple[Any, GoogleGenerativeAIEmbeddings]:
 
 
 # ---------------------------------------------------------------------------
-# Punto de entrada para consultas del usuario
+# Punto de entrada
 # ---------------------------------------------------------------------------
 def process_query(query_text: str) -> Dict[str, Any]:
     """
-    Procesa la consulta del usuario con el agente SQL.
-    - Genera embedding 1024d del texto y lo adjunta al input para que el agente
-      pueda usarlo como literal en consultas vectoriales (si lo necesita).
-    - Ejecuta la acción del agente y devuelve una respuesta limpia.
-
-    Returns:
-        dict: {
-          "answer": <str>,
-          "sql_query": <list> (si verbose/intermediate_steps está disponible)
-        }
+    Ejecuta el agente con la pregunta del usuario.
+    - Activa embedding SOLO si la intención sugiere búsqueda semántica.
+    - Devuelve la respuesta limpia y, si es posible, las queries SQL detectadas.
     """
     try:
         q = (query_text or "").strip()
         if not q:
             return {"error": "La consulta está vacía.", "status": "error"}
 
-        logger.info("Procesando consulta: %s", q)
+        logger.info("Consulta recibida: %s", q)
 
         agent_executor, embedding_function = get_components()
 
-        # Genera embedding 1024d
-        query_embedding = embedding_function.embed_query(q)
+        # Decide si adjuntar embedding (para consultas semánticas)
+        formatted_input = q
+        if _looks_semantic_query(q):
+            try:
+                vec = embedding_function.embed_query(q)
+                # Usamos sintaxis de array JSON legible por extensión vector (como literal),
+                # el agente lo puede inyectar en ORDER BY … <=> [v1, v2, …].
+                formatted_input = f"{q}\n\nVECTOR_1024D:\n{json.dumps(vec)}"
+            except Exception as e:
+                logger.warning("Fallo generando embedding (se continúa sin vector): %s", e)
 
-        # Inyecta el embedding en el prompt para que el agente pueda usarlo
-        # como literal SQL si decide hacer búsqueda semántica:
-        #  ORDER BY licitacion_chunk.embedding_vec <=> '[v1, v2, ...]' LIMIT 10;
-        formatted_input = (
-            f"{q}\n\n"
-            "Embedding_1024_para_busqueda_semantica:\n"
-            f"{str(query_embedding)}"
-        )
-
-        # Ejecuta el agente
+        # Invoca agente
         result = agent_executor.invoke({"input": formatted_input})
 
-        # Limpia la salida del modelo a 'str'
+        # Respuesta de texto limpia
         answer_raw = result.get("output") if isinstance(result, dict) else result
-        answer_text = _to_text(answer_raw)
+        answer_text = _to_text(answer_raw).strip()
+
+        # Si por alguna razón el modelo cae en una respuesta genérica, refuérzalo:
+        if not answer_text or "proporciona la pregunta" in answer_text.lower():
+            answer_text = "No pude derivar una respuesta válida desde la base de datos. Reformula de forma más concreta (incluye columnas / filtros)."
+
+        # Extraer SQL (si disponible)
+        sql_steps = _extract_sql_steps(result)
 
         return {
-            "answer": answer_text or "No se encontró una respuesta.",
-            "sql_query": result.get("intermediate_steps", []) if isinstance(result, dict) else [],
+            "answer": answer_text or "Sin respuesta.",
+            "sql_query": sql_steps,
         }
 
     except Exception as e:
